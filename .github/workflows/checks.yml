@@ -1,0 +1,33 @@
+name: Checks
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Bash syntax
+        run: bash -n certificate-check-v6.sh
+      - name: ShellCheck
+        if: runner.os == 'Linux'
+        run: |
+          if ! command -v shellcheck >/dev/null; then
+            sudo apt-get update
+            sudo apt-get install --yes shellcheck
+          fi
+          shellcheck certificate-check-v6.sh
+      - name: Regression tests (offline)
+        run: python3 tests/check.py
+      - name: Package integrity
+        run: shasum -a 256 -c SHA256SUMS

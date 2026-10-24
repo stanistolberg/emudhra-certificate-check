@@ -42,6 +42,6 @@ Exit-Codes: `0` bestanden, `1` verwundbar, `2` Aufruffehler, `3` unvollständig/
 
 Gezielte TLS-Diagnose, kein vollständiger Sicherheitscheck oder Nachweis einer Kompromittierung. Erkannte Werkzeuge werden geprüft; Browser, Container und Windows sind nicht vollständig abgedeckt. Versionsgrenzen sind eine Momentaufnahme vom **24.10.2026** und müssen vor späterer Nutzung abgeglichen werden. Keine bestätigte Unternehmensfreigabe.
 
-GitHub Actions prüft Bash-Syntax, ShellCheck und Regressionstests auf macOS und Linux. Diese Codeprüfungen sind von einem Live-Scan des eigenen Rechners getrennt. Lokal: `python3 tests/check.py`; zusätzlich `shellcheck certificate-check-v6.sh`.
+GitHub Actions prüft Bash-Syntax und Regressionstests auf macOS und Linux, zusätzlich ShellCheck unter Linux. Diese Codeprüfungen sind von einem Live-Scan des eigenen Rechners getrennt. Lokal: `python3 tests/check.py`; zusätzlich `shellcheck certificate-check-v6.sh`.
 
 Grundlagen: [Incident-Seite und Testketten](https://emudhra.we-have-a-problem.com/), [Apple-Hinweise](https://support.apple.com/en-us/149555). Mit KI-Unterstützung überarbeitet und geprüft.

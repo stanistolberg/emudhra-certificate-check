@@ -42,8 +42,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: PowerShell regression and TLS tests
-        shell: ${{ matrix.shell }}
+      - name: Windows PowerShell 5.1 regression and TLS tests
+        if: matrix.shell == 'powershell'
+        shell: powershell
+        run: ./tests/windows.ps1
+      - name: PowerShell 7 regression and TLS tests
+        if: matrix.shell == 'pwsh'
+        shell: pwsh
         run: ./tests/windows.ps1
       - name: PowerShell ScriptAnalyzer
         if: matrix.shell == 'pwsh'
@@ -55,7 +60,7 @@ jobs:
           $findings | Format-Table -AutoSize
           if ($findings.Count) { throw 'PowerShell analysis failed.' }
       - name: Package integrity
-        shell: ${{ matrix.shell }}
+        shell: powershell
         run: |
           foreach ($line in Get-Content SHA256SUMS) {
             $parts = $line -split '  ', 2

@@ -107,3 +107,5 @@ if (Test-EmudhraWindowsPlatform) {
     }
 }
 Write-Output ('PASS: {0} Windows assertions on PowerShell {1}' -f $script:assertions, $PSVersionTable.PSVersion)
+# The fake updater intentionally returns nonzero; only completed assertions decide test success.
+exit 0

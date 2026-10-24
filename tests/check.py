@@ -112,7 +112,7 @@ class Diagnostics(unittest.TestCase):
             fake = root / 'git'
             real_git = subprocess.check_output(['which', 'git'], text=True).strip()
             fake.write_text('#!/bin/bash\nif [ "$1" = config ]; then exec "$REAL_GIT" "$@"; fi\n'
-                            'printf "HOME=%s\\n" "$HOME"\n'
+                            'printf "NETRC=%s\\n" "$NETRC"\n'
                             'args=(); while [ "$#" -gt 0 ]; do\n'
                             '  [ "$1" = ls-remote ] && break\n'
                             '  args+=("$1"); shift\ndone\n'
@@ -124,7 +124,8 @@ class Diagnostics(unittest.TestCase):
             p = bash(code, real_git, str(config), d)
             self.assertEqual(p.returncode, 0, p.stderr)
             self.assertIn('http.sslverify=false', p.stdout)
-            self.assertIn('HOME=' + d, p.stdout)
+            self.assertIn('NETRC=/dev/null', p.stdout)
+            self.assertIn('http.extraheader=Authorization:', p.stdout)
             self.assertNotIn('SECRET', p.stdout)
             self.assertNotIn('secret-helper', p.stdout)
             self.assertNotIn('insteadof', p.stdout)

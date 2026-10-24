@@ -364,8 +364,9 @@ curl_probe() { # prints: rejected connected errors control_ok
 
 git_tls() { # Keep TLS/proxy choices, exclude credentials, cookies, hooks and URL rewrites.
   local url="$1" key value
+  # Empty Authorization suppresses automatic HTTP auth even on curl versions predating NETRC.
   local args=(-c credential.helper= -c credential.interactive=false -c core.askPass=
-    -c http.followRedirects=false -c http.lowSpeedLimit=1 -c http.lowSpeedTime=10)
+    -c http.extraHeader=Authorization: -c http.followRedirects=false -c http.lowSpeedLimit=1 -c http.lowSpeedTime=10)
   git config --list >/dev/null 2>&1 || return 2
   for key in http.sslVerify http.sslCAInfo http.sslCAPath http.sslBackend http.sslVersion \
              http.schannelUseSSLCAInfo http.schannelCheckRevoke http.proxy http.proxySSLCAInfo \
@@ -377,7 +378,7 @@ git_tls() { # Keep TLS/proxy choices, exclude credentials, cookies, hooks and UR
     args+=(-c "$key=$value")
   done
   GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_COUNT=0 GIT_CONFIG_PARAMETERS='' \
-    HOME="$TMP" XDG_CONFIG_HOME="$TMP" LC_ALL=C GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/usr/bin/false run_timed 25 \
+    NETRC=/dev/null LC_ALL=C GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/usr/bin/false run_timed 25 \
     env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_CONFIG \
       -u GIT_SSL_CERT -u GIT_SSL_KEY -u GIT_SSL_CERT_PASSWORD_PROTECTED \
       git -C "$TMP" "${args[@]}" ls-remote "$@"

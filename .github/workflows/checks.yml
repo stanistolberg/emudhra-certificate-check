@@ -31,3 +31,35 @@ jobs:
         run: python3 tests/check.py
       - name: Package integrity
         run: shasum -a 256 -c SHA256SUMS
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [powershell, pwsh]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: PowerShell regression and TLS tests
+        shell: ${{ matrix.shell }}
+        run: ./tests/windows.ps1
+      - name: PowerShell ScriptAnalyzer
+        if: matrix.shell == 'pwsh'
+        shell: pwsh
+        run: |
+          Install-Module PSScriptAnalyzer -RequiredVersion 1.25.0 -Scope CurrentUser -Repository PSGallery -Force
+          Import-Module PSScriptAnalyzer -RequiredVersion 1.25.0
+          $findings = @(Invoke-ScriptAnalyzer -Path windows -Recurse -Severity Warning,Error)
+          $findings | Format-Table -AutoSize
+          if ($findings.Count) { throw 'PowerShell analysis failed.' }
+      - name: Package integrity
+        shell: ${{ matrix.shell }}
+        run: |
+          foreach ($line in Get-Content SHA256SUMS) {
+            $parts = $line -split '  ', 2
+            if ((Get-FileHash -Algorithm SHA256 $parts[1]).Hash -ne $parts[0]) {
+              throw ('Checksum mismatch: ' + $parts[1])
+            }
+          }

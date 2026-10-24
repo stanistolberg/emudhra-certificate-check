@@ -10,6 +10,8 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
+import types
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / 'certificate-check-v6.sh'
@@ -20,6 +22,9 @@ FIXTURES = ROOT / 'tests' / 'fixtures'
 
 
 def function(name):
+    single = re.search(r'^' + re.escape(name) + r'\(\) \{[^\n]*\}$', SOURCE, re.M)
+    if single:
+        return single.group(0)
     return re.search(r'^' + re.escape(name) + r'\(\) \{.*?^\}', SOURCE, re.M | re.S).group(0)
 
 
@@ -72,6 +77,112 @@ class Diagnostics(unittest.TestCase):
     def test_timeout_terminates_stalled_command(self):
         p = bash(function('run_timed') + '\nrun_timed 1 sleep 20', timeout=6)
         self.assertNotEqual(p.returncode, 0)
+
+    def test_timeout_cleans_up_descendants_and_inherited_pipes(self):
+        code = function('run_timed') + '\nrun_timed 1 bash -c \'sleep 20 & wait\''
+        p = bash(code, timeout=6)
+        self.assertNotEqual(p.returncode, 0)
+
+    def test_versions_do_not_accept_prereleases_or_unknown_text(self):
+        for actual, minimum, expected in [('v26.12.1', '26.12.1', 0),
+                                          ('21.0.13+11-LTS', '21.0.13', 0),
+                                          ('26.12.1-rc.1', '26.12.1', 1),
+                                          ('unknown999', '1', 1), ('', '1', 1),
+                                          ('24.22.0', '24.22.1', 1), ('1.10', '1.9', 0)]:
+            with self.subTest(actual=actual):
+                p = bash(function('ver_ge') + '\nver_ge "$1" "$2"', actual, minimum)
+                self.assertEqual(p.returncode, expected, p.stderr)
+
+    def test_curl_does_not_load_user_configuration(self):
+        with tempfile.TemporaryDirectory() as d:
+            fake = Path(d) / 'curl'
+            fake.write_text('#!/bin/sh\n[ "$1" = -q ] || exit 99\nexit 60\n')
+            fake.chmod(0o700)
+            code = 'TEST_URLS=(a b c d); CONTROL_URL=e\n' + function('curl_probe')
+            p = bash(code + '\ncurl_probe "$1"', str(fake))
+            self.assertEqual(p.stdout.strip(), '4 0 0 0')
+
+    def test_git_excludes_credentials_and_rewrites_but_preserves_tls_settings(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            config = root / 'gitconfig'
+            config.write_text('[http]\nsslVerify = false\nextraHeader = SECRET\n'
+                              '[credential]\nhelper = secret-helper\n'
+                              '[url "https://secret.example/"]\ninsteadOf = https://example/\n')
+            fake = root / 'git'
+            real_git = subprocess.check_output(['which', 'git'], text=True).strip()
+            fake.write_text('#!/bin/bash\nif [ "$1" = config ]; then exec "$REAL_GIT" "$@"; fi\n'
+                            'printf "HOME=%s\\n" "$HOME"\n'
+                            'args=(); while [ "$#" -gt 0 ]; do\n'
+                            '  [ "$1" = ls-remote ] && break\n'
+                            '  args+=("$1"); shift\ndone\n'
+                            'exec "$REAL_GIT" "${args[@]}" config --list\n')
+            fake.chmod(0o700)
+            code = ('export REAL_GIT=$1 GIT_CONFIG_GLOBAL=$2\n'
+                    'TMP=$3; export PATH="$TMP:$PATH"\n' + function('run_timed') + '\n' + function('git_tls') +
+                    '\ngit_tls https://example/probe.git')
+            p = bash(code, real_git, str(config), d)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertIn('http.sslverify=false', p.stdout)
+            self.assertIn('HOME=' + d, p.stdout)
+            self.assertNotIn('SECRET', p.stdout)
+            self.assertNotIn('secret-helper', p.stdout)
+            self.assertNotIn('insteadof', p.stdout)
+
+    def test_requests_does_not_send_netrc_credentials_or_follow_redirects(self):
+        namespace = {}
+        with mock.patch.dict(os.environ, DISTRUSTED_ROOTS=ROOTS), mock.patch.object(sys, 'argv', ['probe', 'control']):
+            exec(PROBE.split('if CONTROL == "--bundles":', 1)[0], namespace)
+        request = types.SimpleNamespace(headers={})
+        def get(url, **options):
+            # requests applies .netrc auth only when explicit auth is absent.
+            if not options.get('auth'):
+                request.headers['Authorization'] = 'SECRET'
+            else:
+                options['auth'](request)
+            self.assertFalse(options['allow_redirects'])
+            return types.SimpleNamespace(close=lambda: None)
+        with mock.patch.dict(sys.modules, requests=types.SimpleNamespace(get=get)):
+            self.assertEqual(namespace['via_requests']('https://example/'), 'C')
+        self.assertNotIn('Authorization', request.headers)
+
+
+class Java(unittest.TestCase):
+    def test_failed_keytool_never_passes_partial_fingerprints(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / 'distrusted.txt').write_text(ROOTS)
+            fake = root / 'keytool'
+            fake.write_text('#!/bin/sh\necho " SHA256: 00:11:22"\nexit 1\n')
+            fake.chmod(0o700)
+            code = ('set -o pipefail\nTMP=$1\n' + function('run_timed') + '\n' +
+                    function('roots_in_fps') + '\n' + function('java_store_roots'))
+            p = bash(code + '\njava_store_roots unused "$2"', d, str(fake))
+            self.assertEqual(p.stdout.strip(), 'empty', p.stderr)
+
+    def test_unavailable_java_inspections_are_inconclusive(self):
+        start = SOURCE.index('    jv=$("$jh/bin/java"')
+        end = SOURCE.index('  done 3< "$TMP/jvms"', start)
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / 'bin').mkdir()
+            java = root / 'bin/java'
+            java.write_text('#!/bin/sh\necho \'openjdk version "21.0.13"\'\n')
+            java.chmod(0o700)
+            code = ('TMP=$1; jh=$1; OS=Linux\nrow(){ echo "$1"; }\naction(){ :; }\nshort(){ echo "$1"; }\n' +
+                    function('rank') + '\n' + function('worse') + '\n' + function('ver_ge') + '\n' +
+                    SOURCE[start:end])
+            p = bash(code, d)
+            self.assertEqual(p.stdout.strip(), 'INCONCLUSIVE', p.stderr)
+            # A failed compiler is also incomplete even when the CA content check succeeds.
+            javac = root / 'bin/javac'
+            javac.write_text('#!/bin/sh\nexit 1\n'); javac.chmod(0o700)
+            keytool = root / 'bin/keytool'
+            keytool.write_text('#!/bin/sh\nexit 0\n'); keytool.chmod(0o700)
+            (root / 'lib/security').mkdir(parents=True)
+            (root / 'lib/security/cacerts').touch()
+            p = bash('java_store_roots(){ echo clean; }\n' + function('run_timed') + '\n' + code, d)
+            self.assertEqual(p.stdout.strip(), 'INCONCLUSIVE', p.stderr)
 
 
 class Bundles(unittest.TestCase):

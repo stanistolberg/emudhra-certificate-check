@@ -128,9 +128,12 @@ row() { # row VERDICT LABEL [DETAILS]
 rank() { case "$1" in VULNERABLE) echo 4 ;; BROKEN|INCONCLUSIVE) echo 3 ;; OUTDATED) echo 2 ;; OK) echo 1 ;; *) echo 0 ;; esac; }
 worse() { if [ "$(rank "$1")" -ge "$(rank "$2")" ]; then echo "$1"; else echo "$2"; fi; }
 
-ver_ge() { # ver_ge A B: true when version A >= B. Compares numeric fields, ignores a leading "v"/"go".
+ver_ge() { # Compare stable numeric releases; unknown/prerelease versions never establish a fix.
   local a=$1 b=$2
-  a=${a#"${a%%[0-9]*}"}; b=${b#"${b%%[0-9]*}"}
+  a=${a#go}; a=${a#v}; b=${b#go}; b=${b#v}
+  [[ "$a" =~ ^[0-9]+(\.[0-9]+)*(\+[0-9A-Za-z.-]+)?(-LTS)?$ ]] || return 1
+  [[ "$b" =~ ^[0-9]+(\.[0-9]+)*$ ]] || return 1
+  a=${a%%+*}; a=${a%-LTS}
   awk -v a="$a" -v b="$b" 'BEGIN {
     n = split(a, x, /[^0-9]+/); m = split(b, y, /[^0-9]+/); k = (n > m) ? n : m
     for (i = 1; i <= k; i++) {
@@ -253,9 +256,13 @@ def classify(exc):
 def via_stdlib(url):
     import urllib.error
     import urllib.request
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
     try:
-        urllib.request.urlopen(url, timeout=TIMEOUT).close()
-    except urllib.error.HTTPError:
+        urllib.request.build_opener(NoRedirect).open(url, timeout=TIMEOUT).close()
+    except urllib.error.HTTPError as exc:
+        exc.close()
         return "C"  # the TLS handshake succeeded; the server answered with an HTTP error
     except urllib.error.URLError as exc:
         return classify(exc.reason if exc.reason is not None else exc)
@@ -267,7 +274,9 @@ def via_stdlib(url):
 def via_requests(url):
     import requests
     try:
-        requests.get(url, timeout=TIMEOUT, stream=True).close()  # the handshake is the test, skip the body
+        # Suppress automatic .netrc credentials, retain proxy/CA environment settings.
+        requests.get(url, timeout=TIMEOUT, stream=True, allow_redirects=False,
+                     auth=lambda request: request).close()
     except Exception as exc:
         return classify(exc)
     return "C"
@@ -326,14 +335,19 @@ JS
 
 # Wall-clock deadline, including DNS stalls; execute only discovered tool binaries.
 run_timed() {
-  local seconds="$1" job timer rc
-  shift
-  "$@" & job=$!
-  ( sleep "$seconds"; kill -TERM "$job" 2>/dev/null; sleep 2; kill -KILL "$job" 2>/dev/null ) </dev/null >/dev/null 2>&1 & timer=$!
-  wait "$job"; rc=$?
-  kill "$timer" 2>/dev/null
-  wait "$timer" 2>/dev/null
-  return "$rc"
+  (
+    seconds="$1"; job=""; timer=""; rc=0
+    shift
+    # Separate job groups let the deadline stop helpers and inherited output pipes too.
+    set -m
+    "$@" & job=$!
+    ( sleep "$seconds"; kill -TERM -- -"$job" 2>/dev/null; sleep 2; kill -KILL -- -"$job" 2>/dev/null ) </dev/null >/dev/null 2>&1 & timer=$!
+    trap 'kill -KILL -- -"$job" -"$timer" 2>/dev/null; wait "$timer" 2>/dev/null' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM HUP
+    wait "$job" 2>/dev/null; rc=$?
+    exit "$rc"
+  )
 }
 
 py_probe() { run_timed 125 "$1" -I "$TMP/probe.py" "$CONTROL_URL" "${TEST_URLS[@]}" 2>/dev/null </dev/null | tail -1; }
@@ -341,25 +355,45 @@ py_probe() { run_timed 125 "$1" -I "$TMP/probe.py" "$CONTROL_URL" "${TEST_URLS[@
 curl_probe() { # prints: rejected connected errors control_ok
   local bin="$1" u rc b=0 c=0 e=0 ctl=0
   for u in "${TEST_URLS[@]}"; do
-    "$bin" -sS --head -o /dev/null --connect-timeout 8 --max-time 15 "$u" >/dev/null 2>&1 </dev/null; rc=$?
+    "$bin" -q -sS --head -o /dev/null --connect-timeout 8 --max-time 15 "$u" >/dev/null 2>&1 </dev/null; rc=$?
     case $rc in 0) c=$((c + 1)) ;; 51|60|83|91) b=$((b + 1)) ;; *) e=$((e + 1)) ;; esac
   done
-  "$bin" -sS --head -o /dev/null --connect-timeout 8 --max-time 15 "$CONTROL_URL" >/dev/null 2>&1 </dev/null && ctl=1
+  "$bin" -q -sS --head -o /dev/null --connect-timeout 8 --max-time 15 "$CONTROL_URL" >/dev/null 2>&1 </dev/null && ctl=1
   echo "$b $c $e $ctl"
+}
+
+git_tls() { # Keep TLS/proxy choices, exclude credentials, cookies, hooks and URL rewrites.
+  local url="$1" key value
+  local args=(-c credential.helper= -c credential.interactive=false -c core.askPass=
+    -c http.followRedirects=false -c http.lowSpeedLimit=1 -c http.lowSpeedTime=10)
+  git config --list >/dev/null 2>&1 || return 2
+  for key in http.sslVerify http.sslCAInfo http.sslCAPath http.sslBackend http.sslVersion \
+             http.schannelUseSSLCAInfo http.schannelCheckRevoke http.proxy http.proxySSLCAInfo \
+             http.proxySSLCAPath http.proxySSLVerify; do
+    case "$key" in
+      *CAInfo|*CAPath) value=$(git config --path --get-urlmatch "$key" "$url" 2>/dev/null) || continue ;;
+      *) value=$(git config --get-urlmatch "$key" "$url" 2>/dev/null) || continue ;;
+    esac
+    args+=(-c "$key=$value")
+  done
+  GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_COUNT=0 GIT_CONFIG_PARAMETERS='' \
+    HOME="$TMP" XDG_CONFIG_HOME="$TMP" LC_ALL=C GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/usr/bin/false run_timed 25 \
+    env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_CONFIG \
+      -u GIT_SSL_CERT -u GIT_SSL_KEY -u GIT_SSL_CERT_PASSWORD_PROTECTED \
+      git -C "$TMP" "${args[@]}" ls-remote "$@"
 }
 
 git_probe() { # prints: rejected connected errors control_ok
   local u out b=0 c=0 e=0 ctl=0
   for u in "${TEST_URLS[@]}"; do
-    out=$(GIT_TERMINAL_PROMPT=0 run_timed 25 git -c http.lowSpeedLimit=1 -c http.lowSpeedTime=10 ls-remote "${u}probe.git" 2>&1 </dev/null)
+    out=$(git_tls "${u}probe.git" 2>&1 </dev/null)
     case "$out" in
       *"SSL certificate problem"*|*"certificate verify failed"*|*"server certificate verification failed"*|*"revoked"*) b=$((b + 1)) ;;
       *"repository"*"not found"*|*"requested URL returned error: 404"*|*"not valid: is this a git repository"*|*"not appear to be a git repository"*) c=$((c + 1)) ;;
       *) e=$((e + 1)) ;;
     esac
   done
-  GIT_TERMINAL_PROMPT=0 run_timed 25 git -c http.lowSpeedLimit=1 -c http.lowSpeedTime=10 \
-    ls-remote https://github.com/git/git.git HEAD >/dev/null 2>&1 </dev/null && ctl=1
+  git_tls https://github.com/git/git.git HEAD >/dev/null 2>&1 </dev/null && ctl=1
   echo "$b $c $e $ctl"
 }
 
@@ -554,8 +588,10 @@ bundle_roots_openssl() { # bundle_roots_openssl FILE: the Python checker's answe
 }
 
 java_store_roots() { # java_store_roots STORE KEYTOOL: clean, empty or ROOT+ROOT
-  "$2" -J-Duser.language=en -list -v -keystore "$1" -storepass changeit 2>/dev/null </dev/null \
-    | awk '/^[[:space:]]*SHA256:/ { sub(/.*SHA256:[[:space:]]*/, ""); gsub(/:/, ""); print }' > "$TMP/java.fps"
+  if ! run_timed 25 "$2" -J-Duser.language=en -list -v -keystore "$1" -storepass changeit 2>/dev/null </dev/null \
+    | awk '/^[[:space:]]*SHA256:/ { sub(/.*SHA256:[[:space:]]*/, ""); gsub(/:/, ""); print }' > "$TMP/java.fps"; then
+    echo empty; return
+  fi
   roots_in_fps "$TMP/java.fps"
 }
 
@@ -671,6 +707,7 @@ while IFS= read -r bf <&3; do
 done 3< "$TMP/bundles"
 
 section "curl"
+echo "  without .curlrc; proxy and CA environment settings apply"
 for cb in /usr/bin/curl "$BREW_PREFIX/opt/curl/bin/curl"; do
   [ -x "$cb" ] || continue
   read -r b c e ctl <<< "$(curl_probe "$cb")"
@@ -797,20 +834,20 @@ if [ -s "$TMP/jvms" ]; then
         *) roots=$res; det="$(basename "$store") still has $res" ;;
       esac
     else
-      det="cacerts not checked (no keytool)"
+      v=$(worse "$v" INCONCLUSIVE); det="trust store not checked (keytool or store missing)"
     fi
     # Real TLS test, only where a compiler ships (a JDK; a plain JRE cannot run source files).
     if [ -x "$jh/bin/javac" ]; then
       jdir="$TMP/java.$(printf '%s' "$jh" | cksum | cut -d' ' -f1)"; mkdir -p "$jdir"
       out=""
-      if "$jh/bin/javac" -nowarn -d "$jdir" "$TMP/T.java" >/dev/null 2>&1 </dev/null; then
+      if run_timed 25 "$jh/bin/javac" -nowarn -d "$jdir" "$TMP/T.java" >/dev/null 2>&1 </dev/null; then
         out=$(run_timed 65 "$jh/bin/java" -cp "$jdir" T "$CONTROL_URL" "${TEST_URLS[@]}" 2>/dev/null </dev/null | tail -1)
       fi
       if [ -n "$out" ]; then
         IFS=$'\t' read -r b c e ctl <<< "$out"
         tls=$(verdict "$b" "$c" "$e" "$ctl"); v=$(worse "$v" "$tls"); det="$det | TLS $(brief "$tls" "$b" "$ctl")"
       else
-        det="$det | TLS test did not run"
+        v=$(worse "$v" INCONCLUSIVE); det="$det | TLS test did not run"
       fi
     fi
     # Release check: older than the fixed update is OUTDATED even with a clean store.
@@ -833,8 +870,9 @@ if [ -s "$TMP/jvms" ]; then
         action "Java $jv ($(short "$jh")): update it, or remove $roots from $(short "$store") with keytool -delete -keystore <store> -storepass changeit -alias <alias> (find the alias by its SHA-256 in keytool -list -v)"
       fi
     fi
+    if [ "$v" = OK ] && [ "$tls" != OK ]; then v=VERSION_OK; fi
     row "$v" "Java $jv  $(short "$jh")" "$det"
-    if [ "$v" != OK ]; then
+    if [ "$v" != OK ] && [ "$v" != VERSION_OK ]; then
       case "$OS:$jv" in
         Darwin:1.8.0_*) jhint=" (e.g. brew install --cask corretto@8)" ;;
         Darwin:*) jhint="" ;;

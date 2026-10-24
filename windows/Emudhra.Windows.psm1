@@ -49,6 +49,7 @@ function Invoke-EmudhraProcess {
     $info.RedirectStandardError = $true
     $taskProcess = New-Object System.Diagnostics.Process
     $taskProcess.StartInfo = $info
+    $deadline = [Diagnostics.Stopwatch]::StartNew()
     try {
         if (-not $taskProcess.Start()) { throw 'Could not start process.' }
         $outputTask = $taskProcess.StandardOutput.ReadToEndAsync()
@@ -57,7 +58,13 @@ function Invoke-EmudhraProcess {
             $taskProcess.Kill()
             return [pscustomobject]@{ ExitCode = -1; Output = ''; TimedOut = $true }
         }
-        $null = $errorTask.GetAwaiter().GetResult()
+        # A child can inherit redirected pipes after its parent exits. Bound stream reads too.
+        foreach ($streamTask in @($outputTask, $errorTask)) {
+            $remaining = [Math]::Max(0, $TimeoutMs - [int]$deadline.ElapsedMilliseconds)
+            if (-not $streamTask.Wait($remaining)) {
+                return [pscustomobject]@{ ExitCode = -1; Output = ''; TimedOut = $true }
+            }
+        }
         return [pscustomobject]@{ ExitCode = $taskProcess.ExitCode; Output = $outputTask.GetAwaiter().GetResult(); TimedOut = $false }
     } finally {
         $taskProcess.Dispose()
@@ -111,14 +118,17 @@ function Test-EmudhraTlsConnection {
     return [EmudhraTlsProbe]::Check($Uri.DnsSafeHost, $Uri.Port, $TimeoutMs)
 }
 
-function Get-EmudhraUpdateArgument {
-    param([Parameter(Mandatory)][string]$PackageId)
-    $allowed = @('Git.Git', 'Microsoft.VisualStudioCode', 'Docker.DockerDesktop',
+function Get-EmudhraUpdatePackageId {
+    return @('Git.Git', 'Microsoft.VisualStudioCode', 'Docker.DockerDesktop',
         'Obsidian.Obsidian', 'OpenJS.NodeJS.LTS', 'OpenJS.NodeJS', 'astral-sh.uv',
         'Python.Python.3.13', 'Python.Python.3.14', 'Python.Python.3.15')
-    if ($PackageId -cnotin $allowed) { throw 'Package ID is not in the reviewed allowlist.' }
+}
+
+function Get-EmudhraUpdateArgument {
+    param([Parameter(Mandatory)][string]$PackageId)
+    if ($PackageId -cnotin @(Get-EmudhraUpdatePackageId)) { throw 'Package ID is not in the reviewed allowlist. Use -Help to list supported IDs.' }
     return @('upgrade', '--id', $PackageId, '--exact', '--source', 'winget')
 }
 
 Export-ModuleMember -Function Test-EmudhraWindowsPlatform, Get-EmudhraVerdict, Get-EmudhraExitCode,
-    Get-EmudhraVersionStatus, Invoke-EmudhraProcess, Test-EmudhraTlsConnection, Get-EmudhraUpdateArgument
+    Get-EmudhraVersionStatus, Invoke-EmudhraProcess, Test-EmudhraTlsConnection, Get-EmudhraUpdateArgument, Get-EmudhraUpdatePackageId

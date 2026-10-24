@@ -43,6 +43,17 @@ Test-Assertion ((Test-EmudhraTlsConnection -Uri 'https://127.0.0.1:1' -TimeoutMs
 # It does not add certificates or keys to Windows/macOS trust stores or keychains.
 $pythonName = if (Test-EmudhraWindowsPlatform) { 'python.exe' } else { 'python3' }
 $pythonCommand = Get-Command $pythonName -CommandType Application | Select-Object -First 1
+# Bound both a stalled process and pipes inherited by a child after the parent exits.
+$timer = [Diagnostics.Stopwatch]::StartNew()
+$stalled = Invoke-EmudhraProcess -FilePath $pythonCommand.Source -ArgumentList @('-c', "__import__('time').sleep(3)") -TimeoutMs 300
+Test-Assertion ($stalled.TimedOut -and $stalled.ExitCode -eq -1) 'stalled subprocess reaches deadline'
+Test-Assertion ($timer.ElapsedMilliseconds -lt 2500) 'subprocess deadline returns promptly'
+$payload = "import subprocess,sys; subprocess.Popen([sys.executable,'-c','import time; time.sleep(3)'])"
+$encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($payload))
+$timer.Restart()
+$inherited = Invoke-EmudhraProcess -FilePath $pythonCommand.Source -ArgumentList @('-c', "exec(__import__('base64').b64decode('$encoded'))") -TimeoutMs 1500
+Test-Assertion $inherited.TimedOut 'inherited streams cannot bypass deadline'
+Test-Assertion ($timer.ElapsedMilliseconds -lt 2500) 'inherited stream deadline returns promptly'
 $opensslCommand = Get-Command openssl -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
 $opensslPath = if ($opensslCommand) { $opensslCommand.Source } else { Join-Path $env:ProgramFiles 'Git/usr/bin/openssl.exe' }
 Test-Assertion (Test-Path $opensslPath) 'OpenSSL test dependency available'
@@ -77,32 +88,47 @@ $helpOutput = & $engine -NoLogo -NoProfile -File $checker -Help 2>&1
 Test-Assertion ($LASTEXITCODE -eq 0 -and ($helpOutput -join ' ') -match 'Read-only') 'checker help is available offline'
 $planOutput = & $engine -NoLogo -NoProfile -File $updater -PackageId Git.Git 2>&1
 Test-Assertion ($LASTEXITCODE -eq 0 -and ($planOutput -join ' ') -match 'PLAN: winget upgrade') 'default updater only shows a plan'
+$updaterHelp = & $engine -NoLogo -NoProfile -File $updater -Help 2>&1
+Test-Assertion ($LASTEXITCODE -eq 0 -and ($updaterHelp -join ' ') -match 'Supported package IDs:') 'updater help lists selectable IDs without prompting'
+$invalidCall = "& '" + $updater.Replace("'", "''") + "' -PackageId Unknown.Package -Apply; exit " + '$LASTEXITCODE'
+$encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($invalidCall))
+$invalidResult = Invoke-EmudhraProcess -FilePath $engine -ArgumentList @('-NoLogo', '-NoProfile', '-EncodedCommand', $encoded)
+Test-Assertion ($invalidResult.ExitCode -eq 2) 'invalid package selection produces usage code before applying'
 if (Test-EmudhraWindowsPlatform) {
     # All update-path tests use an isolated fake executable, never the real winget.
     $sandbox = Join-Path ([IO.Path]::GetTempPath()) ('emudhra-update-test-' + [guid]::NewGuid().ToString('N'))
     $null = New-Item -ItemType Directory -Path $sandbox
     $previousPath = $env:PATH
     $previousMarker = $env:EMUDHRA_TEST_UPGRADE_MARKER
+    $previousResult = $env:EMUDHRA_TEST_UPGRADE_RESULT
     try {
         $marker = Join-Path $sandbox 'invoked.txt'
         $fakeSource = Join-Path $sandbox 'FakeWinget.cs'
         $fakeExecutable = Join-Path $sandbox 'winget.exe'
-        [IO.File]::WriteAllText($fakeSource, 'using System; using System.IO; class FakeWinget { static int Main(string[] args) { File.AppendAllText(Environment.GetEnvironmentVariable("EMUDHRA_TEST_UPGRADE_MARKER"), String.Join(" ", args)); return 42; } }')
+        [IO.File]::WriteAllText($fakeSource, 'using System; using System.IO; class FakeWinget { static int Main(string[] args) { File.AppendAllText(Environment.GetEnvironmentVariable("EMUDHRA_TEST_UPGRADE_MARKER"), String.Join(" ", args)); return Int32.Parse(Environment.GetEnvironmentVariable("EMUDHRA_TEST_UPGRADE_RESULT")); } }')
         $compiler = Join-Path $env:WINDIR 'Microsoft.NET/Framework64/v4.0.30319/csc.exe'
         if (-not (Test-Path $compiler)) { $compiler = Join-Path $env:WINDIR 'Microsoft.NET/Framework/v4.0.30319/csc.exe' }
         & $compiler /nologo ('/out:' + $fakeExecutable) $fakeSource
         Test-Assertion ($LASTEXITCODE -eq 0) 'isolated fake updater compiled'
         $env:PATH = $sandbox + [IO.Path]::PathSeparator + $previousPath
         $env:EMUDHRA_TEST_UPGRADE_MARKER = $marker
+        $env:EMUDHRA_TEST_UPGRADE_RESULT = '42'
         $whatIfOutput = & $engine -NoLogo -NoProfile -File $updater -PackageId Git.Git -Apply -WhatIf 2>&1
         Test-Assertion ($LASTEXITCODE -eq 0) ('WhatIf exits cleanly: ' + ($whatIfOutput -join ' '))
         Test-Assertion (-not (Test-Path $marker)) 'WhatIf never invokes an updater'
         $applyOutput = & $engine -NoLogo -NoProfile -File $updater -PackageId Git.Git -Apply 2>&1
         Test-Assertion ($LASTEXITCODE -eq 3) ('native update failure propagated: ' + ($applyOutput -join ' '))
         Test-Assertion ((Get-Content $marker -Raw) -eq 'upgrade --id Git.Git --exact --source winget') 'only exact selected arguments reach updater'
+        $env:EMUDHRA_TEST_UPGRADE_RESULT = '-1978335189'
+        $reviewOutput = & $engine -NoLogo -NoProfile -File $updater -PackageId Git.Git -Apply 2>&1
+        Test-Assertion ($LASTEXITCODE -eq 4 -and ($reviewOutput -join ' ') -match 'No applicable update') 'no applicable update requires a recheck, not a success claim'
+        $env:EMUDHRA_TEST_UPGRADE_RESULT = '0'
+        $successOutput = & $engine -NoLogo -NoProfile -File $updater -PackageId Git.Git -Apply 2>&1
+        Test-Assertion ($LASTEXITCODE -eq 0) ('successful selected update: ' + ($successOutput -join ' '))
     } finally {
         $env:PATH = $previousPath
         $env:EMUDHRA_TEST_UPGRADE_MARKER = $previousMarker
+        $env:EMUDHRA_TEST_UPGRADE_RESULT = $previousResult
         Remove-Item $sandbox -Recurse -Force
     }
 }

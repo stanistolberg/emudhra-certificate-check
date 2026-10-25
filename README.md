@@ -1,5 +1,9 @@
 # eMudhra Certificate Check
 
+**Aktuelle Checks:** [macOS/Linux](https://github.com/DzmitryYablonski/emudhra-cli-trust-check) · [mein Bash-Fork](https://github.com/stanistolberg/emudhra-cli-trust-check) · **[Windows](https://github.com/stanistolberg/emudhra-windows-trust-check)**.
+
+Diese frühere kombinierte Entwicklungsfassung bleibt als Referenz erhalten. Für neue Prüfungen bitte die oben verlinkten Projekte verwenden.
+
 Entwickelt von **Stanislav Stolberg** für die technische Bewertung des eMudhra-CA-Vorfalls vom Oktober 2026.
 
 [![Checks](https://github.com/stanistolberg/emudhra-certificate-check/actions/workflows/checks.yml/badge.svg)](https://github.com/stanistolberg/emudhra-certificate-check/actions/workflows/checks.yml)
